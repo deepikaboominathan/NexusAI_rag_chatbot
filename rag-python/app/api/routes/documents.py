@@ -257,3 +257,103 @@ async def upload_document(
     finally:
         db.close()
         await file.close()
+
+@router.post("/{document_id}/reprocess")
+def reprocess_document(
+    document_id: int,
+    authenticated: bool = Depends(verify_api_token),
+    db: Session = Depends(get_db),
+):
+    # 1. Find the existing document.
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id)
+        .first()
+    )
+
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    # 2. Verify that the original uploaded file exists.
+    file_path = Path(document.file_path)
+
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Original uploaded file was not found.",
+        )
+
+    try:
+        # 3. Extract the original text and prepare new chunks.
+        extracted_text = extract_text(file_path)
+        new_chunks = split_text(extracted_text)
+
+        if not new_chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="No usable text was found in the document.",
+            )
+
+        # 4. Replace old chunks only after new chunks are ready.
+        db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document_id
+        ).delete(synchronize_session=False)
+
+        for chunk_index, chunk_content in enumerate(new_chunks):
+            db.add(
+                DocumentChunk(
+                    document_id=document_id,
+                    chunk_index=chunk_index,
+                    content=chunk_content,
+                )
+            )
+
+        document.status = "processed"
+
+        # 5. Save the replacement chunks.
+        db.commit()
+        db.refresh(document)
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not reprocess the document.",
+        ) from exc
+
+    # 6. Rebuild FAISS using the updated database chunks.
+    try:
+        rebuild_vector_index(db)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger("nexusai.documents").exception(
+            "Document reprocessed, but FAISS rebuilding failed."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "New chunks were saved, but FAISS rebuilding failed. "
+                "The vector index needs to be rebuilt before searching."
+            ),
+        ) from exc
+
+    return {
+        "success": True,
+        "document_id": document.id,
+        "filename": document.filename,
+        "characters_extracted": len(extracted_text),
+        "chunks_created": len(new_chunks),
+        "message": (
+            "Document reprocessed with the current chunking logic "
+            "and indexed in FAISS."
+        ),
+    }
